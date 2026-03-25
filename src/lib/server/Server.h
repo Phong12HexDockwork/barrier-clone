@@ -151,6 +151,13 @@ public:
     //! Store ClientListener pointer
     void                setListener(ClientListener* p) { m_clientListener = p; }
 
+    //! Receive client mouse-activity report
+    /*!
+    Called by the client proxy when the client reports local physical
+    mouse movement (moving=true) or idle (moving=false).
+    */
+    void                onClientMouseActivity(bool moving);
+
     //@}
     //! @name accessors
     //@{
@@ -316,6 +323,8 @@ private:
     void                handleFakeInputEndEvent(const Event&, void*);
     void                handleFileChunkSendingEvent(const Event&, void*);
     void                handleFileRecieveCompletedEvent(const Event&, void*);
+    void                handleServerMouseIdle(const Event&, void*);
+    void                handleClientMouseIdle(const Event&, void*);
 
     // event processing
     void                onClipboardChanged(BaseClientProxy* sender,
@@ -333,6 +342,11 @@ private:
     void                onMouseWheel(SInt32 xDelta, SInt32 yDelta);
     void                onFileChunkSending(const void* data);
     void                onFileRecieveCompleted();
+
+    // mouse-activity state machine
+    void                updateKeyboardFocus();
+    void                restartServerIdleTimer();
+    void                restartClientIdleTimer();
 
     // add client to list and attach event handlers for client
     bool                addClient(BaseClientProxy*);
@@ -481,4 +495,10 @@ private:
 
     ClientListener*        m_clientListener;
     ServerArgs            m_args;
+
+    // --- mouse-activity keyboard-focus state machine ---
+    bool                m_serverMouseMoving;  // W_Moving: server local mouse is active
+    bool                m_clientMouseMoving;  // M_Moving: client local mouse is active
+    EventQueueTimer*    m_serverIdleTimer;    // fires 200ms after server stops moving
+    EventQueueTimer*    m_clientIdleTimer;    // fires 200ms after client stops moving
 };

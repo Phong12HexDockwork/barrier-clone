@@ -25,6 +25,7 @@
 class Event;
 class EventQueueTimer;
 class IEventQueue;
+class Server;
 
 //! Proxy for client implementing protocol version 1.0
 class ClientProxy1_0 : public ClientProxy {
@@ -71,6 +72,10 @@ protected:
     virtual void        addHeartbeatTimer();
     virtual void        removeHeartbeatTimer();
     virtual bool        recvClipboard();
+
+public:
+    //! Set the owning server (called by Server::adoptClient)
+    void                setServer(Server* server) { m_server = server; }
 private:
     void                disconnect();
     void                removeHandlers();
@@ -82,6 +87,7 @@ private:
 
     bool                recvInfo();
     bool                recvGrabClipboard();
+    bool                recvMouseActivity();
 
 protected:
     struct ClientClipboard {
@@ -104,4 +110,5 @@ private:
     EventQueueTimer*    m_heartbeatTimer;
     MessageParser        m_parser;
     IEventQueue*        m_events;
+    Server*             m_server;  // owning server, may be NULL before adoptClient
 };

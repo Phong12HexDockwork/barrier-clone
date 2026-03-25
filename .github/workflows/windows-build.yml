@@ -1,0 +1,121 @@
+name: Windows Build
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+    branches: ['*']
+
+jobs:
+  windows-build:
+    name: Build Windows x64
+    runs-on: windows-2019
+    
+    strategy:
+      matrix:
+        build_type: [Release]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Qt 5
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          arch: 'win64_msvc2019_64'
+          cache: true
+
+      - name: Download Bonjour SDK
+        shell: powershell
+        run: |
+          # Download a minimal Bonjour SDK-like (dns_sd.h + lib)
+          $sdkDir = "C:\Program Files\Bonjour SDK"
+          New-Item -ItemType Directory -Force -Path "$sdkDir\Include"
+          New-Item -ItemType Directory -Force -Path "$sdkDir\Lib\x64"
+          
+          # Download from the azure-pipelines script approach
+          $releases = "https://github.com/nicbhz/boern-jour/releases/download"
+          $version = "v1.0.0"
+          Invoke-WebRequest "$releases/$version/bonjoursdk-like.zip" -OutFile "$env:TEMP\bonjour.zip" -ErrorAction SilentlyContinue
+          
+          if (Test-Path "$env:TEMP\bonjour.zip") {
+            Expand-Archive -Path "$env:TEMP\bonjour.zip" -DestinationPath "$env:TEMP\bonjour" -Force
+            Copy-Item -Path "$env:TEMP\bonjour\*" -Destination "$sdkDir" -Recurse -Force
+          }
+          
+          # Fallback: Check if the azure-pipelines script exists and use it
+          if (Test-Path "azure-pipelines\download_install_bonjour_sdk_like.ps1") {
+            try {
+              & "azure-pipelines\download_install_bonjour_sdk_like.ps1"
+            } catch {
+              Write-Host "Bonjour SDK download script failed, continuing anyway..."
+            }
+          }
+
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          mkdir build
+          cd build
+          cmake -G "Visual Studio 16 2019" -A x64 ^
+            -D CMAKE_BUILD_TYPE=${{ matrix.build_type }} ^
+            -D CMAKE_PREFIX_PATH="%Qt5_DIR%\..\..\.." ^
+            -D BARRIER_BUILD_GUI=ON ^
+            -D BARRIER_BUILD_INSTALLER=OFF ^
+            -D BARRIER_BUILD_TESTS=OFF ^
+            ..
+
+      - name: Build
+        shell: cmd
+        run: |
+          cd build
+          cmake --build . --config ${{ matrix.build_type }} -- /m
+
+      - name: Collect binaries and dependencies
+        shell: powershell
+        run: |
+          $buildType = "${{ matrix.build_type }}"
+          $outputDir = "barrier-windows-x64"
+          New-Item -ItemType Directory -Force -Path $outputDir
+
+          # Copy built executables
+          $binDir = "build\bin\$buildType"
+          if (-not (Test-Path $binDir)) {
+            $binDir = "build\bin"
+          }
+          Copy-Item -Path "$binDir\*.exe" -Destination $outputDir -Force -ErrorAction SilentlyContinue
+
+          # Copy OpenSSL DLLs
+          $opensslBin = "ext\openssl\windows\x64\bin"
+          if (Test-Path $opensslBin) {
+            Copy-Item -Path "$opensslBin\*" -Destination $outputDir -Force -ErrorAction SilentlyContinue
+          }
+
+          # Copy barrier.conf
+          if (Test-Path "res\openssl\barrier.conf") {
+            Copy-Item -Path "res\openssl\barrier.conf" -Destination $outputDir -Force
+          }
+
+          # Use windeployqt to collect Qt dependencies
+          $windeployqt = Get-ChildItem -Path $env:Qt5_DIR -Recurse -Filter "windeployqt.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $windeployqt) {
+            $windeployqt = Get-ChildItem -Path "$env:RUNNER_TOOL_CACHE" -Recurse -Filter "windeployqt.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          
+          $guiExe = Get-ChildItem -Path $outputDir -Filter "barrier.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($windeployqt -and $guiExe) {
+            & $windeployqt.FullName --no-translations --no-compiler-runtime "$($guiExe.FullName)"
+          }
+
+          # List contents
+          Get-ChildItem -Path $outputDir -Recurse | Format-Table Name, Length
+
+      - name: Upload Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: barrier-windows-x64-${{ matrix.build_type }}
+          path: barrier-windows-x64/
+          retention-days: 90

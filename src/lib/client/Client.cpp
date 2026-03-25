@@ -44,6 +44,11 @@
 #include <stdexcept>
 #include <fstream>
 
+// Idle threshold in seconds: if no local mouse activity for this long,
+// stop sending kMsgCMouseActivity to the server and let the server's own
+// idle timer fire.
+static const double kMouseActivityIdleTimeout = 0.150;
+
 //
 // Client
 //
@@ -70,7 +75,8 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
     m_socket(NULL),
     m_useSecureNetwork(args.m_enableCrypto),
     m_args(args),
-    m_enableClipboard(true)
+    m_enableClipboard(true),
+    m_localMouseActivityTimer(NULL)
 {
     assert(m_socketFactory != NULL);
     assert(m_screen        != NULL);
@@ -84,6 +90,17 @@ Client::Client(IEventQueue* events, const std::string& name, const NetworkAddres
                             getEventTarget(),
                             new TMethodEventJob<Client>(this,
                                 &Client::handleResume));
+
+    // subscribe to local physical mouse movement so we can notify the
+    // server via kMsgCMouseActivity (keyboard-focus state machine).
+    m_events->adoptHandler(
+        m_events->forIPrimaryScreen().motionOnPrimary(),
+        getEventTarget(),
+        new TMethodEventJob<Client>(this, &Client::handleLocalMouseActivity));
+    m_events->adoptHandler(
+        m_events->forIPrimaryScreen().motionOnSecondary(),
+        getEventTarget(),
+        new TMethodEventJob<Client>(this, &Client::handleLocalMouseActivity));
 
     if (m_args.m_enableDragDrop) {
         m_events->adoptHandler(m_events->forFile().fileChunkSending(),
@@ -107,6 +124,15 @@ Client::~Client()
                               getEventTarget());
     m_events->removeHandler(m_events->forIScreen().resume(),
                               getEventTarget());
+    m_events->removeHandler(m_events->forIPrimaryScreen().motionOnPrimary(),
+                              getEventTarget());
+    m_events->removeHandler(m_events->forIPrimaryScreen().motionOnSecondary(),
+                              getEventTarget());
+
+    if (m_localMouseActivityTimer != NULL) {
+        m_events->deleteTimer(m_localMouseActivityTimer);
+        m_localMouseActivityTimer = NULL;
+    }
 
     cleanupTimer();
     cleanupScreen();
@@ -827,4 +853,48 @@ void
 Client::sendDragInfo(UInt32 fileCount, std::string& info, size_t size)
 {
     m_server->sendDragInfo(fileCount, info.c_str(), size);
+}
+
+// ---------------------------------------------------------------------------
+// Local mouse-activity detection (keyboard-focus state machine)
+// ---------------------------------------------------------------------------
+
+void
+Client::handleLocalMouseActivity(const Event&, void*)
+{
+    // Send kMsgCMouseActivity(1) to the server to signal that our physical
+    // mouse is moving.  We throttle by resetting a short idle timer; the
+    // server's own 200 ms idle timer will clear M_Moving if we stop sending.
+    if (m_stream == NULL) {
+        return;
+    }
+
+    try {
+        ProtocolUtil::writef(m_stream, kMsgCMouseActivity, (UInt16)1);
+    }
+    catch (...) {
+        // Ignore write errors here; the connection-error handler will
+        // catch the underlying problem.
+    }
+
+    // Restart the local idle timer so we know when the user stops moving.
+    if (m_localMouseActivityTimer != NULL) {
+        m_events->deleteTimer(m_localMouseActivityTimer);
+        m_localMouseActivityTimer = NULL;
+    }
+    m_localMouseActivityTimer = m_events->newOneShotTimer(
+        kMouseActivityIdleTimeout, NULL);
+    m_events->adoptHandler(Event::kTimer, m_localMouseActivityTimer,
+        new TMethodEventJob<Client>(this,
+            &Client::handleLocalMouseActivityTimeout));
+}
+
+void
+Client::handleLocalMouseActivityTimeout(const Event&, void*)
+{
+    m_localMouseActivityTimer = NULL;
+    // Mouse has gone idle on the client.  We don't send an explicit
+    // idle message because the server's 200 ms idle timer will fire
+    // automatically and reset M_Moving.
+    LOG((CLOG_DEBUG2 "local mouse activity timeout (client idle)"));
 }

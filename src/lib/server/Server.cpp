@@ -19,6 +19,7 @@
 #include "server/Server.h"
 
 #include "server/ClientProxy.h"
+#include "server/ClientProxy1_0.h"
 #include "server/ClientProxyUnknown.h"
 #include "server/PrimaryClient.h"
 #include "server/ClientListener.h"
@@ -92,7 +93,11 @@ Server::Server(
 	m_enableClipboard(true),
 	m_sendDragInfoThread(NULL),
 	m_waitDragInfoThread(true),
-	m_args(args)
+	m_args(args),
+	m_serverMouseMoving(false),
+	m_clientMouseMoving(false),
+	m_serverIdleTimer(NULL),
+	m_clientIdleTimer(NULL)
 {
 	// must have a primary client and it must have a canonical name
 	assert(m_primaryClient != NULL);
@@ -336,6 +341,15 @@ Server::adoptClient(BaseClientProxy* client)
 		return;
 	}
 	LOG((CLOG_NOTE "client \"%s\" has connected", getName(client).c_str()));
+
+	// give the proxy a back-reference to this server so it can call
+	// onClientMouseActivity() when it receives kMsgCMouseActivity messages.
+	{
+		ClientProxy1_0* cp = dynamic_cast<ClientProxy1_0*>(client);
+		if (cp != NULL) {
+			cp->setServer(this);
+		}
+	}
 
 	// send configuration options to client
 	sendOptions(client);
@@ -1798,45 +1812,15 @@ Server::onMouseMovePrimary(SInt32 x, SInt32 y)
 		dirv = kBottom;
 	}
 	if (dirh == kNoDirection && dirv == kNoDirection) {
-		// still on local screen
-		noSwitch(x, y);
-		return false;
+		// still on local screen — update W_Moving state
 	}
 
-	// check both horizontally and vertically
-	EDirection dirs[] = {dirh, dirv};
-	SInt32 xs[] = {xh, x}, ys[] = {y, yv};
-	for (int i = 0; i < 2; ++i) {
-		EDirection dir = dirs[i];
-		if (dir == kNoDirection) {
-			continue;
-		}
-		x = xs[i], y = ys[i];
-
-		// get jump destination
-		BaseClientProxy* newScreen = mapToNeighbor(m_active, dir, x, y);
-
-		// should we switch or not?
-		if (isSwitchOkay(newScreen, dir, x, y, xc, yc)) {
-			if (m_args.m_enableDragDrop
-				&& m_screen->isDraggingStarted()
-				&& m_active != newScreen
-				&& m_waitDragInfoThread) {
-				if (m_sendDragInfoThread == NULL) {
-                    m_sendDragInfoThread = new Thread([this, newScreen]()
-                                                      { send_drag_info_thread(newScreen); });
-				}
-
-				return false;
-			}
-
-			// switch screen
-			switchScreen(newScreen, x, y, false);
-			m_waitDragInfoThread = true;
-			return true;
-		}
-	}
-
+	// MOUSE-ACTIVITY STATE MACHINE: server (W) local mouse is moving.
+	// Screen-edge transitions are intentionally disabled.
+	restartServerIdleTimer();
+	m_serverMouseMoving = true;
+	updateKeyboardFocus();
+	noSwitch(x, y);
 	return false;
 }
 
@@ -1885,174 +1869,13 @@ Server::sendDragInfo(BaseClientProxy* newScreen)
 		newScreen->sendDragInfo(fileCount, info, size);
 	}
 }
-
 void
 Server::onMouseMoveSecondary(SInt32 dx, SInt32 dy)
 {
-	LOG((CLOG_DEBUG2 "onMouseMoveSecondary %+d,%+d", dx, dy));
-
-	// mouse move on secondary (client's) screen
-	assert(m_active != NULL);
-	if (m_active == m_primaryClient) {
-		// stale event -- we're actually on the primary screen
-		return;
-	}
-
-	// if doing relative motion on secondary screens and we're locked
-	// to the screen (which activates relative moves) then send a
-	// relative mouse motion.  when we're doing this we pretend as if
-	// the mouse isn't actually moving because we're expecting some
-	// program on the secondary screen to warp the mouse on us, so we
-	// have no idea where it really is.
-	if (m_relativeMoves && isLockedToScreenServer()) {
-		LOG((CLOG_DEBUG2 "relative move on %s by %d,%d", getName(m_active).c_str(), dx, dy));
-		m_active->mouseRelativeMove(dx, dy);
-		return;
-	}
-
-	// save old position
-	const SInt32 xOld = m_x;
-	const SInt32 yOld = m_y;
-
-	// save last delta
-	m_xDelta2 = m_xDelta;
-	m_yDelta2 = m_yDelta;
-
-	// save current delta
-	m_xDelta  = dx;
-	m_yDelta  = dy;
-
-	// accumulate motion
-	m_x      += dx;
-	m_y      += dy;
-
-	// get screen shape
-	SInt32 ax, ay, aw, ah;
-	m_active->getShape(ax, ay, aw, ah);
-
-	// find direction of neighbor and get the neighbor
-	bool jump = true;
-	BaseClientProxy* newScreen;
-	do {
-		// clamp position to screen
-		SInt32 xc = m_x, yc = m_y;
-		if (xc < ax) {
-			xc = ax;
-		}
-		else if (xc >= ax + aw) {
-			xc = ax + aw - 1;
-		}
-		if (yc < ay) {
-			yc = ay;
-		}
-		else if (yc >= ay + ah) {
-			yc = ay + ah - 1;
-		}
-
-		EDirection dir;
-		if (m_x < ax) {
-			dir = kLeft;
-		}
-		else if (m_x > ax + aw - 1) {
-			dir = kRight;
-		}
-		else if (m_y < ay) {
-			dir = kTop;
-		}
-		else if (m_y > ay + ah - 1) {
-			dir = kBottom;
-		}
-		else {
-			// we haven't left the screen
-			newScreen = m_active;
-			jump      = false;
-
-			// if waiting and mouse is not on the border we're waiting
-			// on then stop waiting.  also if it's not on the border
-			// then arm the double tap.
-			if (m_switchScreen != NULL) {
-				bool clearWait;
-				SInt32 zoneSize = m_primaryClient->getJumpZoneSize();
-				switch (m_switchDir) {
-				case kLeft:
-					clearWait = (m_x >= ax + zoneSize);
-					break;
-
-				case kRight:
-					clearWait = (m_x <= ax + aw - 1 - zoneSize);
-					break;
-
-				case kTop:
-					clearWait = (m_y >= ay + zoneSize);
-					break;
-
-				case kBottom:
-					clearWait = (m_y <= ay + ah - 1 + zoneSize);
-					break;
-
-				default:
-					clearWait = false;
-					break;
-				}
-				if (clearWait) {
-					// still on local screen
-					noSwitch(m_x, m_y);
-				}
-			}
-
-			// skip rest of block
-			break;
-		}
-
-		// try to switch screen.  get the neighbor.
-		newScreen = mapToNeighbor(m_active, dir, m_x, m_y);
-
-		// see if we should switch
-		if (!isSwitchOkay(newScreen, dir, m_x, m_y, xc, yc)) {
-			newScreen = m_active;
-			jump      = false;
-		}
-	} while (false);
-
-	if (jump) {
-		if (m_sendFileThread != NULL) {
-			StreamChunker::interruptFile();
-			m_sendFileThread = NULL;
-		}
-
-		SInt32 newX = m_x;
-		SInt32 newY = m_y;
-
-		// switch screens
-		switchScreen(newScreen, newX, newY, false);
-	}
-	else {
-		// same screen.  clamp mouse to edge.
-		m_x = xOld + dx;
-		m_y = yOld + dy;
-		if (m_x < ax) {
-			m_x = ax;
-			LOG((CLOG_DEBUG2 "clamp to left of \"%s\"", getName(m_active).c_str()));
-		}
-		else if (m_x > ax + aw - 1) {
-			m_x = ax + aw - 1;
-			LOG((CLOG_DEBUG2 "clamp to right of \"%s\"", getName(m_active).c_str()));
-		}
-		if (m_y < ay) {
-			m_y = ay;
-			LOG((CLOG_DEBUG2 "clamp to top of \"%s\"", getName(m_active).c_str()));
-		}
-		else if (m_y > ay + ah - 1) {
-			m_y = ay + ah - 1;
-			LOG((CLOG_DEBUG2 "clamp to bottom of \"%s\"", getName(m_active).c_str()));
-		}
-
-		// warp cursor if it moved.
-		if (m_x != xOld || m_y != yOld) {
-			LOG((CLOG_DEBUG2 "move on %s to %d,%d", getName(m_active).c_str(), m_x, m_y));
-			m_active->mouseMove(m_x, m_y);
-		}
-	}
+	// MOUSE-ACTIVITY STATE MACHINE: secondary mouse move is a synthetic
+	// cursor warp. Screen-edge detection on secondary is intentionally
+	// disabled. Nothing to do here.
+	(void)dx; (void)dy;
 }
 
 void
@@ -2412,4 +2235,102 @@ Server::dragInfoReceived(UInt32 fileNum, std::string content)
 	DragInformation::parseDragInfo(m_fakeDragFileList, fileNum, content);
 
 	m_screen->startDraggingFiles(m_fakeDragFileList);
+}
+
+// ---------------------------------------------------------------------------
+// Mouse-activity keyboard-focus state machine
+// ---------------------------------------------------------------------------
+
+void
+Server::restartServerIdleTimer()
+{
+	if (m_serverIdleTimer != NULL) {
+		m_events->deleteTimer(m_serverIdleTimer);
+		m_serverIdleTimer = NULL;
+	}
+	m_serverIdleTimer = m_events->newOneShotTimer(0.200, NULL);
+	m_events->adoptHandler(Event::kTimer, m_serverIdleTimer,
+		new TMethodEventJob<Server>(this, &Server::handleServerMouseIdle));
+}
+
+void
+Server::restartClientIdleTimer()
+{
+	if (m_clientIdleTimer != NULL) {
+		m_events->deleteTimer(m_clientIdleTimer);
+		m_clientIdleTimer = NULL;
+	}
+	m_clientIdleTimer = m_events->newOneShotTimer(0.200, NULL);
+	m_events->adoptHandler(Event::kTimer, m_clientIdleTimer,
+		new TMethodEventJob<Server>(this, &Server::handleClientMouseIdle));
+}
+
+void
+Server::handleServerMouseIdle(const Event&, void*)
+{
+	m_serverIdleTimer = NULL;
+	m_serverMouseMoving = false;
+	LOG((CLOG_DEBUG2 "server mouse idle"));
+	updateKeyboardFocus();
+}
+
+void
+Server::handleClientMouseIdle(const Event&, void*)
+{
+	m_clientIdleTimer = NULL;
+	m_clientMouseMoving = false;
+	LOG((CLOG_DEBUG2 "client mouse idle"));
+	updateKeyboardFocus();
+}
+
+void
+Server::onClientMouseActivity(bool moving)
+{
+	LOG((CLOG_DEBUG2 "client mouse activity: %s", moving ? "moving" : "idle"));
+	if (moving) {
+		restartClientIdleTimer();
+		m_clientMouseMoving = true;
+	} else {
+		if (m_clientIdleTimer != NULL) {
+			m_events->deleteTimer(m_clientIdleTimer);
+			m_clientIdleTimer = NULL;
+		}
+		m_clientMouseMoving = false;
+	}
+	updateKeyboardFocus();
+}
+
+void
+Server::updateKeyboardFocus()
+{
+	BaseClientProxy* target = NULL;
+
+	if (m_serverMouseMoving) {
+		// W is moving — focus goes to server (primary)
+		target = m_primaryClient;
+	} else if (m_clientMouseMoving) {
+		// M is moving — focus goes to the first non-primary client
+		for (ClientList::const_iterator it = m_clients.begin();
+			 it != m_clients.end(); ++it) {
+			if (it->second != m_primaryClient) {
+				target = it->second;
+				break;
+			}
+		}
+		if (target == NULL) {
+			return; // no client connected yet
+		}
+	} else {
+		// Both idle — preserve current focus
+		return;
+	}
+
+	if (target != m_active) {
+		LOG((CLOG_INFO "mouse-activity focus switch: %s -> %s",
+			getName(m_active).c_str(), getName(target).c_str()));
+		// Move cursor to center of target screen
+		SInt32 x, y, w, h;
+		target->getShape(x, y, w, h);
+		switchScreen(target, x + w / 2, y + h / 2, false);
+	}
 }

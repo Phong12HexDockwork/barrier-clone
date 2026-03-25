@@ -18,6 +18,7 @@
 
 #include "server/ClientProxy1_0.h"
 
+#include "server/Server.h"
 #include "barrier/ProtocolUtil.h"
 #include "barrier/XBarrier.h"
 #include "io/IStream.h"
@@ -36,7 +37,8 @@ ClientProxy1_0::ClientProxy1_0(const std::string& name, barrier::IStream* stream
     ClientProxy(name, stream),
     m_heartbeatTimer(NULL),
     m_parser(&ClientProxy1_0::parseHandshakeMessage),
-    m_events(events)
+    m_events(events),
+    m_server(NULL)
 {
     // install event handlers
     m_events->adoptHandler(m_events->forIStream().inputReady(),
@@ -221,6 +223,9 @@ ClientProxy1_0::parseMessage(const UInt8* code)
     }
     else if (memcmp(code, kMsgDClipboard, 4) == 0) {
         return recvClipboard();
+    }
+    else if (memcmp(code, kMsgCMouseActivity, 4) == 0) {
+        return recvMouseActivity();
     }
     return false;
 }
@@ -499,4 +504,20 @@ ClientProxy1_0::ClientClipboard::ClientClipboard() :
     m_dirty(true)
 {
     // do nothing
+}
+
+bool
+ClientProxy1_0::recvMouseActivity()
+{
+    // parse the message: one uint16 flag (1=moving, 0=idle)
+    UInt16 flag = 0;
+    if (!ProtocolUtil::readf(getStream(), kMsgCMouseActivity + 4, &flag)) {
+        return false;
+    }
+    LOG((CLOG_DEBUG2 "recv mouse activity from \"%s\": %d", getName().c_str(), flag));
+
+    if (m_server != NULL) {
+        m_server->onClientMouseActivity(flag != 0);
+    }
+    return true;
 }

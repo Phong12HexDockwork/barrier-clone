@@ -193,6 +193,8 @@ private:
     void                handleStopRetry(const Event&, void*);
     void                onFileRecieveCompleted();
     void                sendClipboardThread(void*);
+    void                handleLocalMouseActivity(const Event&, void*);
+    void                handleLocalMouseActivityTimeout(const Event&, void*);
 
 public:
     bool                m_mock;
@@ -224,4 +226,5 @@ private:
     bool                m_useSecureNetwork;
     ClientArgs            m_args;
     bool                m_enableClipboard;
+    EventQueueTimer*    m_localMouseActivityTimer;  // throttle activity msgs
 };

@@ -281,6 +281,11 @@ extern const char*        kMsgDFileTransfer;
 // of each object's directory.
 extern const char*        kMsgDDragInfo;
 
+// mouse activity report: secondary -> primary
+// sent by client to tell the server its local physical mouse is moving (1) or idle (0).
+// $1 = uint16 activity flag (1=moving, 0=idle)
+extern const char*        kMsgCMouseActivity;
+
 //
 // query codes
 //

@@ -12,8 +12,6 @@ check_dir_exists() {
 }
 
 if [ -z "$BARRIER_BUILD_ENV" ]; then
-    check_dir_exists '/Applications/Xcode.app' 'Xcode'
-
     printf "Modifying environment for Barrier build...\n"
 
     if command -v port; then
